@@ -9,10 +9,11 @@
 - **自带引擎指标**：fps / 帧耗时 / 各阶段耗时（逻辑/物理/渲染/提交）/ drawcall / 实例数 / 三角面 / 显存
 - **结构化指标**：阈值标红、平均窗口、排序、格式化
 - **默认开关态 + 用户选择持久化**：注册时声明 `defaultEnabled: false` 默认关；用户在 UI 上的开关存 `localStorage`，下次启动按用户选择来（`_touched` 集合区分"默认值生效" vs "用户已选择"，不互相覆盖）
-- **独立 Canvas + Camera 隔离渲染**：用引擎自带的 `Layers.Enum.PROFILER` 层 + 独立 Camera（priority 极高），物理隔离业务任何 UI 都覆盖不到
+- **双挂载模式**：可挂到宿主提供的现有 UI 节点并复用其 render layer；未提供宿主时回退独立 Canvas + Camera
 - **输入透明**：覆写面板节点的 `UITransform.hitTest`，被覆盖的按钮可正常点
-- **跨场景持久挂载**：通过 `director.addPersistRootNode` 标记，切场景时引擎不销毁面板节点，无需重挂
-- **预览页 toolbar 联动**：自动监听 Cocos Creator 预览页 `Show FPS` 按钮的 click，点击即切换面板，无需业务侧显式接入
+- **跨场景 fallback**：独立 Canvas 模式通过 `director.addPersistRootNode` 保持跨场景；宿主模式跟随宿主节点生命周期
+- **自动或显式初始化**：零配置时首帧自动装配；也可向 `initializeProfiler()` 传入 `() => Promise<Node>`，由接入方自行等待宿主
+- **预览页 toolbar 联动**：初始化后监听 Cocos Creator 预览页 `Show FPS` 按钮的 click，点击即切换面板
 - **全局静态开关**：`setProfilerEnabled(false)` 一键关，`showProfiler` / toolbar 联动均 noop、已显示也立即 hide。供 iframe 嵌入态宿主一行压住面板自启，无需跟 toolbar bind 抢时序
 - **Label CHAR 池化**：文本逐行用 Label + `cacheMode = CHAR`，多行 Label 共享字符 atlas batch 成单 drawcall，面板自身渲染开销稳定可预期
 - **持久化**：勾选状态存 `localStorage`，可换实现
@@ -31,13 +32,37 @@ Cocos Creator `>= 3.8.0`。已在 3.8.5 / 3.8.7 / 3.8.8 上验证。
 import 'db://cc-profiler/cocos/cocos-profiler';
 ```
 
-模块加载即自动联动预览页 toolbar 的 `Show FPS` 按钮，点击即出现面板。无需更多接入。
+不调用任何初始化函数时，模块会在首帧自动装配并联动预览页 toolbar 的 `Show FPS` 按钮。
+
+已有 UI 框架、希望复用现有 Camera 时，使用显式初始化。库只接收最终的 `Promise<cc.Node>`，不依赖宿主的 UIManager：
+
+```ts
+import { initializeProfiler } from 'db://cc-profiler/cocos/cocos-profiler';
+
+initializeProfiler(async () => {
+    await waitUntilUIReady();
+    return getExistingTopUIRoot();
+});
+```
+
+初始化 Promise 完成前不会绑定 toolbar 或创建 fallback Camera。完全不调用 `initializeProfiler` 时，仍保持独立 Canvas + Camera 的开箱即用行为。
 
 ## 用法
 
 ```ts
 import { profiler } from 'db://cc-profiler/core/registry';
-import { showProfiler, hideProfiler, setProfilerEnabled } from 'db://cc-profiler/cocos/cocos-profiler';
+import {
+    hideProfiler,
+    initializeProfiler,
+    setProfilerEnabled,
+    showProfiler,
+} from 'db://cc-profiler/cocos/cocos-profiler';
+
+// 可选：业务已有顶层 UI 宿主时显式初始化；不调用则首帧自动装配
+initializeProfiler(async () => {
+    await waitUntilUIReady();
+    return getExistingTopUIRoot();
+});
 
 // 结构化指标
 profiler.register({
@@ -52,11 +77,10 @@ profiler.register({
 // 自定义文本段（复杂展示逃生舱），第 4 参 defaultEnabled 缺省 true
 profiler.rawSection('net', () => `网络: ${connected ? '已连接' : '断开'}`, 70, false);
 
-showProfiler();   // 显示面板（自建挂载，无需传节点）
+showProfiler();   // 显示面板；优先挂宿主节点，否则使用独立 fallback
 hideProfiler();
 
-// 嵌入态宿主静态关闭整套面板（toolbar 自启 / show / GM 切换全部 noop，已显示也立即 hide）
-// 只要在 module 加载后、首帧 AFTER_UPDATE 触发前同步调一次，import 顺序就能保证时序
+// 嵌入态宿主静态关闭整套面板（toolbar / show 均 noop，已显示也立即 hide）
 setProfilerEnabled(false);
 ```
 
@@ -65,9 +89,29 @@ setProfilerEnabled(false);
 | 层 | 路径 | 依赖 | 职责 |
 |---|---|---|---|
 | 内核 | `lib/core/` | 零（纯 TS） | 注册表 + Metric 模型 + 平均窗口 + `snapshot()` 渲染契约 + StorageAdapter 接口 |
-| Cocos 适配 | `lib/cocos/` | `cc` | 面板渲染（独立 Canvas+Camera+PROFILER 层）+ director hook 采样 + 引擎指标注册 + localStorage 持久化 + 预览 toolbar 联动 |
+| Cocos 适配 | `lib/cocos/` | `cc` | 面板渲染（宿主 Node 或独立 fallback）+ director hook 采样 + 引擎指标注册 + localStorage 持久化 + 预览 toolbar 联动 |
 
 宿主侧只需用 `register` / `rawSection` 把自己的业务指标喂进来（显存、节点数、网络状态…），内核自动纳入勾选 / 持久化 / 渲染。
+
+依赖方向始终是宿主接入层 → `cc-profiler`：宿主可在初始化 Promise 内等待自己的 UIManager，再返回 `cc.Node`；`cc-profiler` 不 import、也不认识任何外部 UI 框架。
+
+## Cocos 初始化 API
+
+```ts
+import type { Node } from 'cc';
+
+type ProfilerInitializer = () => Promise<Node>;
+
+initializeProfiler(initializer?: ProfilerInitializer): Promise<void>;
+```
+
+- 不调用：模块首帧自动初始化，保留独立 Camera fallback。
+- 调用但不传初始化器：显式使用默认独立 Camera fallback。
+- 传初始化器：可在 Promise 内等待业务 UI 就绪，最终返回面板宿主 Node。
+- Promise pending 期间，显示请求只排队，不会创建 fallback Camera；reject 时初始化失败并允许重试。
+- 初始化是 one-shot；进行中或完成后重复调用不会再次执行工厂，也不会动态更换宿主。
+
+返回的宿主节点应当在 Profiler 使用期间持续有效、位于有效 UI 层级中，且它的 layer 必须被现有 Camera 的 visibility 覆盖。库只销毁自己的面板节点，不销毁宿主；等待、超时和取消策略完全由接入方的 Promise 决定。
 
 ## core API
 
@@ -110,7 +154,7 @@ cc-profiler/
 │   │   └── storage.ts        # StorageAdapter 接口 + MemoryStorage 默认实现
 │   └── cocos/                 # Cocos 适配
 │       ├── cocos-profiler.ts # 装配：director hook 采集 + 驱动 + 引擎指标 + show/hide + toolbar 联动
-│       ├── panel.ts          # 面板渲染（独立 Canvas + Camera + PROFILER 层）
+│       ├── panel.ts          # 面板渲染（宿主 Node + 独立 Canvas/Camera fallback）
 │       └── local-storage.ts  # StorageAdapter 的 window.localStorage 实现
 ├── package.json               # 扩展声明 + asset-db.mount
 ├── LICENSE                    # Apache 2.0
@@ -135,7 +179,7 @@ cc-profiler/
 - 请说明使用的 Cocos Creator 版本、复现步骤、期望行为。
 - bug 修复 PR 请附最小复现；新功能 PR 请先开 issue 讨论方案。
 - 改 `lib/core/` 注意保持零引擎依赖（不要 import `cc`）。
-- 改 `lib/cocos/panel.ts` 渲染相关：面板必须挂在 `Layers.Enum.PROFILER` 层并使用独立 Camera，避免被业务 UI 遮挡。
+- 改 `lib/cocos/panel.ts` 渲染相关：宿主模式不得销毁外部节点；fallback 模式继续使用 `Layers.Enum.PROFILER` 与独立 Camera。
 
 ## License
 

@@ -5,9 +5,9 @@
 // Cocos 适配层装配：director hook 采集引擎指标 + 驱动 core 采样 + 面板刷新 + 平台存储注入。
 // 业务层通过 showProfiler / hideProfiler 进出，不直接碰 core 渲染细节。
 
-import { director, DirectorEvent, gfx, profiler as engineProfiler } from 'cc';
+import { director, DirectorEvent, gfx, profiler as engineProfiler, type Node } from 'cc';
 import { profiler } from '../core/registry';
-import { ProfilerPanel } from './panel';
+import { ProfilerPanel, type ProfilerPanelHostProvider } from './panel';
 import { LocalStorageAdapter } from './local-storage';
 
 const { deviceManager } = gfx;
@@ -37,7 +37,10 @@ class ProfilerCocos {
         this._device = deviceManager.gfxDevice;
         this._fpsStart = performance.now();
         this._last = this._fpsStart;
-        this._panel.show();
+        if (!this._panel.show()) {
+            this._device = null;
+            return;
+        }
         this._hook();
         // 关引擎自带 fps 面板：toolbar Show FPS 按钮 click 会同时触发 cc.profiler.showStats 与本 listener，
         // 不关掉会出现"原版 + 自定义面板"并排显示。引擎 11 项指标本面板已覆盖，无并存价值。
@@ -46,7 +49,7 @@ class ProfilerCocos {
     }
 
     public hide(): void {
-        if (!this._panel.isShowing()) return;
+        if (!this._panel.isShowing() && !this._hooked) return;
         this._unhook();
         this._panel.hide();
         this._device = null;
@@ -55,6 +58,10 @@ class ProfilerCocos {
 
     public isShowing(): boolean {
         return this._panel.isShowing();
+    }
+
+    public setPanelHostProvider(provider: ProfilerPanelHostProvider): void {
+        this._panel.setHostProvider(provider);
     }
 
 
@@ -158,6 +165,11 @@ class ProfilerCocos {
         const now = performance.now();
         this._t.frame = now - this._mark.frame;
         this._t.present = now - this._mark.present;
+        if (!this._panel.isShowing()) {
+            this.hide();
+            return;
+        }
+        this._panel.syncHost();
 
         this._frames += 1;
         const elapsed = now - this._fpsStart;
@@ -191,37 +203,123 @@ class ProfilerCocos {
 /** 全局单例：业务接入层 import 同一个。 */
 export const profilerCocos = new ProfilerCocos();
 
+/** 返回 Promise 的宿主初始化器；可在内部等待外部 UI 框架就绪，最终只向库交付 cc.Node。 */
+export type ProfilerInitializer = () => Promise<Node>;
+
 /**
  * 全局静态开关。关闭时：showProfiler 跳过、toolbar 联动按钮点击与启动自启均跳过；
- * 若面板已显示则立即 hide。供嵌入态宿主（如引导编辑器）在 module 加载后、首帧 AFTER_UPDATE 触发前
- * 同步调一次即可彻底压住面板出现；hideProfiler 仍可直接调用。
+ * 若面板已显示则立即 hide。hideProfiler 仍可直接调用。
  */
 let _enabled = true;
+let _explicitInitializationRequested = false;
+let _initialized = false;
+let _initializing: Promise<void> = null;
+let _showAfterInitialization = false;
+let _requestedInitializer: ProfilerInitializer = null;
 
 export function setProfilerEnabled(on: boolean): void {
-    if (_enabled === on) return;
+    if (_enabled === on) {
+        if (!on) {
+            _showAfterInitialization = false;
+            profilerCocos.hide();
+        }
+        return;
+    }
     _enabled = on;
-    if (!on && profilerCocos.isShowing()) profilerCocos.hide();
+    if (!on) {
+        _showAfterInitialization = false;
+        profilerCocos.hide();
+    }
 }
 
 export function isProfilerEnabled(): boolean {
     return _enabled;
 }
 
-/** 显示性能面板（自建独立渲染层，无需宿主传节点）。被 setProfilerEnabled(false) 关闭后此调用 noop。 */
+/** 初始化完成后把确定的宿主节点交给面板；库不感知宿主的 UIManager。 */
+function setProfilerPanelHost(host: Node): void {
+    profilerCocos.setPanelHostProvider(() => host);
+}
+
+/** 显示性能面板。被 setProfilerEnabled(false) 关闭后此调用 noop。 */
 export function showProfiler(): void {
     if (!_enabled) return;
+    if (!_initialized) {
+        _showAfterInitialization = true;
+        if (!_initializing) _startInitialization(true);
+        return;
+    }
     profilerCocos.show();
 }
 
 /** 隐藏性能面板。 */
 export function hideProfiler(): void {
+    _showAfterInitialization = false;
     profilerCocos.hide();
 }
 
 /** 只装配（存储 + 引擎指标），不显示面板。供集成层构建勾选列表时调，幂等。 */
 export function ensureEngineMetrics(): void {
     profilerCocos.ensureSetup();
+}
+
+/** 等待下一次 update，确保预览 view 与首屏尺寸已经稳定。 */
+function waitForNextUpdate(): Promise<void> {
+    return new Promise(resolve => director.once(DirectorEvent.AFTER_UPDATE, resolve));
+}
+
+/** 执行一次宿主初始化器；返回的 Node 作为本次 Profiler 生命周期内的固定宿主。 */
+async function initializePanelHost(): Promise<void> {
+    const initializer = _requestedInitializer;
+    if (!initializer) return;
+    const host = await initializer();
+    if (!host || !host.isValid) {
+        throw new Error('initializeProfiler 的 Promise 必须 resolve 一个有效的 cc.Node');
+    }
+    setProfilerPanelHost(host);
+}
+
+async function _initializeProfiler(waitForViewReady: boolean): Promise<void> {
+    profilerCocos.ensureSetup();
+    if (waitForViewReady) await waitForNextUpdate();
+    // showProfiler 可能先启动初始化，业务随后才传入异步初始化器；
+    // 放在首帧等待之后读取共享状态，显式初始化仍能升级正在进行的自动流程。
+    if (_requestedInitializer) await initializePanelHost();
+
+    _initialized = true;
+    const showAfterInitialization = _showAfterInitialization;
+    _showAfterInitialization = false;
+    bindPreviewToolbarToggle();
+    if (showAfterInitialization && _enabled && !profilerCocos.isShowing()) profilerCocos.show();
+}
+
+function _startInitialization(waitForViewReady: boolean): Promise<void> {
+    if (_initialized) return Promise.resolve();
+    if (_initializing) return _initializing;
+    const task = _initializeProfiler(waitForViewReady);
+    _initializing = task;
+    task.then(
+        () => { if (_initializing === task) _initializing = null; },
+        () => {
+            if (_initializing !== task) return;
+            _initializing = null;
+            _requestedInitializer = null;   // 失败后允许下一次 initializeProfiler 传入新工厂重试
+        },
+    );
+    return task;
+}
+
+/**
+ * 显式初始化 Cocos Profiler。
+ *
+ * 首帧自动装配前调用会接管初始化；初始化器可自行等待外部 UI 就绪并返回宿主 Node。
+ * Promise 完成前 show 请求只排队，不会创建 fallback Camera；不传初始化器则使用默认回退。
+ * 初始化为 one-shot：进行中或已完成时重复调用只返回当前结果，不会更换宿主。
+ */
+export function initializeProfiler(initializer?: ProfilerInitializer): Promise<void> {
+    _explicitInitializationRequested = true;
+    if (!_initialized && !_requestedInitializer && initializer) _requestedInitializer = initializer;
+    return _startInitialization(true);
 }
 
 
@@ -231,7 +329,7 @@ let _toolbarBound = false;
  * 联动 Cocos Creator 预览页 toolbar 的 "Show FPS" 按钮（#btn-show-fps，源自
  * builtin/preview/static/views/toolbar.ejs）：按下显示本面板，再按隐藏。
  * 仅在浏览器预览环境生效；非浏览器（jsb/native）或按钮不存在时静默跳过。幂等。
- * module 顶层会自动调一次，业务侧无需显式调用；只要任意脚本 import 本 module 即生效。
+ * 未显式调用 initializeProfiler 时，module 会在首帧自动调一次。
  */
 export function bindPreviewToolbarToggle(): void {
     if (_toolbarBound) return;
@@ -249,9 +347,11 @@ export function bindPreviewToolbarToggle(): void {
     if (_enabled && btn.classList.contains('checked')) showProfiler();
 }
 
-// module 加载即自动联动 toolbar。任意场景脚本 import 本 module（含间接 import）
-// 都会触发顶层执行，集成层无需显式调用 bindPreviewToolbarToggle。
-// 延迟一帧（AFTER_UPDATE 触发一次）再 bind：module 加载时引擎可能刚跑完场景 launch，
-// view/screen 的 windowSize 尚未完成首次 resize，立刻 showProfiler 会让 Canvas alignWithScreen
-// 用错误的尺寸 → 首次面板渲染不出（要手动 hide+show 才正常）。等首帧 update 完，view 一定就绪。
-director.once(DirectorEvent.AFTER_UPDATE, bindPreviewToolbarToggle);
+/** 未使用显式初始化时保留零配置自动装配；显式入口会在首帧前接管。 */
+function autoInitializeProfiler(): void {
+    if (_explicitInitializationRequested) return;
+    _startInitialization(false);
+}
+
+// 延迟到首帧 AFTER_UPDATE：view/screen 尺寸已稳定；若业务已显式 initialize，则自动装配让位。
+director.once(DirectorEvent.AFTER_UPDATE, autoInitializeProfiler);
