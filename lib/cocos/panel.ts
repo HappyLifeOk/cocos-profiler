@@ -20,7 +20,7 @@ const LEADING = LINE_H - FONT;  // 单行 lineHeight 框比字形高出的 leadi
 const CAMERA_PRIORITY = (1 << 30) + 100;   // 默认 UI Camera priority = 1<<30；+100 确保面板凌驾于业务 camera 之上
 const COLOR_NORMAL = new Color(255, 255, 255, 255);
 const COLOR_WARN = new Color(255, 85, 85, 255);
-const BG_FILL = new Color(0, 0, 0, 160);
+const BG_FILL = new Color(0, 0, 0, 20);
 
 /** 惰性返回可承载面板的现有全屏 UI 节点；返回无效节点时走独立 Camera 回退。 */
 export type ProfilerPanelHostProvider = () => Node;
