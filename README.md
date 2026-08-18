@@ -12,7 +12,7 @@
 - **双挂载模式**：可挂到宿主提供的现有 UI 节点并复用其 render layer；未提供宿主时回退独立 Canvas + Camera
 - **输入透明**：覆写面板节点的 `UITransform.hitTest`，被覆盖的按钮可正常点
 - **跨场景 fallback**：独立 Canvas 模式通过 `director.addPersistRootNode` 保持跨场景；宿主模式跟随宿主节点生命周期
-- **自动或显式初始化**：零配置时首帧自动装配；也可向 `initializeProfiler()` 传入 `() => Promise<Node>`，由接入方自行等待宿主
+- **宿主显式注册**：零配置时首帧自动装配并使用独立 Canvas + Camera；接入方可注册惰性宿主解析器
 - **预览页 toolbar 联动**：初始化后监听 Cocos Creator 预览页 `Show FPS` 按钮的 click，点击即切换面板
 - **全局静态开关**：`setProfilerEnabled(false)` 一键关，`showProfiler` / toolbar 联动均 noop、已显示也立即 hide。供 iframe 嵌入态宿主一行压住面板自启，无需跟 toolbar bind 抢时序
 - **Label CHAR 池化**：文本逐行用 Label + `cacheMode = CHAR`，多行 Label 共享字符 atlas batch 成单 drawcall，面板自身渲染开销稳定可预期
@@ -34,18 +34,15 @@ import 'db://cc-profiler/cocos/cocos-profiler';
 
 不调用任何初始化函数时，模块会在首帧自动装配并联动预览页 toolbar 的 `Show FPS` 按钮。
 
-已有 UI 框架、希望复用现有 Camera 时，使用显式初始化。库只接收最终的 `Promise<cc.Node>`，不依赖宿主的 UIManager：
+已有 UI 框架、希望复用现有 Camera 时，显式注册宿主解析器。库只认识 `cc.Node`，不依赖宿主的 UIManager：
 
 ```ts
-import { initializeProfiler } from 'db://cc-profiler/cocos/cocos-profiler';
+import { registerProfilerPanelHostProvider } from 'db://cc-profiler/cocos/cocos-profiler';
 
-initializeProfiler(async () => {
-    await waitUntilUIReady();
-    return getExistingTopUIRoot();
-});
+registerProfilerPanelHostProvider(() => getExistingTopUIRootOrNull());
 ```
 
-初始化 Promise 完成前不会绑定 toolbar 或创建 fallback Camera。完全不调用 `initializeProfiler` 时，仍保持独立 Canvas + Camera 的开箱即用行为。
+未注册，或解析器当前返回 `null` 时，面板立即使用独立 Canvas + Camera；解析器之后返回有效宿主时，已显示的面板会自动迁移过去。因此接入方无需等待 UI 初始化，也无需设置超时。
 
 ## 用法
 
@@ -54,15 +51,16 @@ import { profiler } from 'db://cc-profiler/core/registry';
 import {
     hideProfiler,
     initializeProfiler,
+    registerProfilerPanelHostProvider,
     setProfilerEnabled,
     showProfiler,
 } from 'db://cc-profiler/cocos/cocos-profiler';
 
-// 可选：业务已有顶层 UI 宿主时显式初始化；不调用则首帧自动装配
-initializeProfiler(async () => {
-    await waitUntilUIReady();
-    return getExistingTopUIRoot();
-});
+// 可选：业务已有顶层 UI 宿主时注册；未就绪返回 null 即可
+registerProfilerPanelHostProvider(() => getExistingTopUIRootOrNull());
+
+// 可选：显式初始化；不调用时模块仍会在首帧自动初始化
+initializeProfiler();
 
 // 结构化指标
 profiler.register({
@@ -93,25 +91,26 @@ setProfilerEnabled(false);
 
 宿主侧只需用 `register` / `rawSection` 把自己的业务指标喂进来（显存、节点数、网络状态…），内核自动纳入勾选 / 持久化 / 渲染。
 
-依赖方向始终是宿主接入层 → `cc-profiler`：宿主可在初始化 Promise 内等待自己的 UIManager，再返回 `cc.Node`；`cc-profiler` 不 import、也不认识任何外部 UI 框架。
+依赖方向始终是宿主接入层 → `cc-profiler`：宿主注册一个惰性解析函数，把自己的 UIManager 适配为 `cc.Node | null`；`cc-profiler` 不 import、也不认识任何外部 UI 框架。
 
 ## Cocos 初始化 API
 
 ```ts
 import type { Node } from 'cc';
 
-type ProfilerInitializer = () => Promise<Node>;
+type ProfilerPanelHostProvider = () => Node | null;
 
-initializeProfiler(initializer?: ProfilerInitializer): Promise<void>;
+registerProfilerPanelHostProvider(provider: ProfilerPanelHostProvider): void;
+initializeProfiler(): Promise<void>;
 ```
 
 - 不调用：模块首帧自动初始化，保留独立 Camera fallback。
-- 调用但不传初始化器：显式使用默认独立 Camera fallback。
-- 传初始化器：可在 Promise 内等待业务 UI 就绪，最终返回面板宿主 Node。
-- Promise pending 期间，显示请求只排队，不会创建 fallback Camera；reject 时初始化失败并允许重试。
-- 初始化是 one-shot；进行中或完成后重复调用不会再次执行工厂，也不会动态更换宿主。
+- 调用 `initializeProfiler()`：显式触发初始化；宿主选择与初始化流程相互独立。
+- 不注册宿主：始终使用默认独立 Canvas + Camera。
+- 注册宿主：每次显示及显示期间惰性解析；返回 `null` 时继续使用默认面板，返回有效节点后自动挂载或迁移。
+- 后一次注册会替换前一次解析器。
 
-返回的宿主节点应当在 Profiler 使用期间持续有效、位于有效 UI 层级中，且它的 layer 必须被现有 Camera 的 visibility 覆盖。库只销毁自己的面板节点，不销毁宿主；等待、超时和取消策略完全由接入方的 Promise 决定。
+返回的宿主节点应当位于有效 UI 层级中，且它的 layer 必须被现有 Camera 的 visibility 覆盖。库只销毁自己的面板节点，不销毁宿主。
 
 ## core API
 

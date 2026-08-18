@@ -22,8 +22,8 @@ const COLOR_NORMAL = new Color(255, 255, 255, 255);
 const COLOR_WARN = new Color(255, 85, 85, 255);
 const BG_FILL = new Color(0, 0, 0, 20);
 
-/** 惰性返回可承载面板的现有全屏 UI 节点；返回无效节点时走独立 Camera 回退。 */
-export type ProfilerPanelHostProvider = () => Node;
+/** 惰性返回可承载面板的现有全屏 UI 节点；未就绪或不提供宿主时返回 null。 */
+export type ProfilerPanelHostProvider = () => Node | null;
 
 /** 性能面板：优先复用宿主 UI Camera，独立场景回退自建 Camera。纯展示，不碰数据采集。 */
 export class ProfilerPanel {

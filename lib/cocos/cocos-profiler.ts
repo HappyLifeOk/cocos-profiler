@@ -5,7 +5,7 @@
 // Cocos 适配层装配：director hook 采集引擎指标 + 驱动 core 采样 + 面板刷新 + 平台存储注入。
 // 业务层通过 showProfiler / hideProfiler 进出，不直接碰 core 渲染细节。
 
-import { director, DirectorEvent, gfx, profiler as engineProfiler, type Node } from 'cc';
+import { director, DirectorEvent, gfx, profiler as engineProfiler } from 'cc';
 import { profiler } from '../core/registry';
 import { ProfilerPanel, type ProfilerPanelHostProvider } from './panel';
 import { LocalStorageAdapter } from './local-storage';
@@ -203,9 +203,6 @@ class ProfilerCocos {
 /** 全局单例：业务接入层 import 同一个。 */
 export const profilerCocos = new ProfilerCocos();
 
-/** 返回 Promise 的宿主初始化器；可在内部等待外部 UI 框架就绪，最终只向库交付 cc.Node。 */
-export type ProfilerInitializer = () => Promise<Node>;
-
 /**
  * 全局静态开关。关闭时：showProfiler 跳过、toolbar 联动按钮点击与启动自启均跳过；
  * 若面板已显示则立即 hide。hideProfiler 仍可直接调用。
@@ -215,7 +212,6 @@ let _explicitInitializationRequested = false;
 let _initialized = false;
 let _initializing: Promise<void> = null;
 let _showAfterInitialization = false;
-let _requestedInitializer: ProfilerInitializer = null;
 
 export function setProfilerEnabled(on: boolean): void {
     if (_enabled === on) {
@@ -236,9 +232,12 @@ export function isProfilerEnabled(): boolean {
     return _enabled;
 }
 
-/** 初始化完成后把确定的宿主节点交给面板；库不感知宿主的 UIManager。 */
-function setProfilerPanelHost(host: Node): void {
-    profilerCocos.setPanelHostProvider(() => host);
+/**
+ * 注册宿主节点解析器。未注册或解析结果为 null 时使用独立 Canvas/Camera；
+ * 解析器之后返回有效节点时，已显示的 fallback 面板也会自动迁移过去。
+ */
+export function registerProfilerPanelHostProvider(provider: ProfilerPanelHostProvider): void {
+    profilerCocos.setPanelHostProvider(provider);
 }
 
 /** 显示性能面板。被 setProfilerEnabled(false) 关闭后此调用 noop。 */
@@ -268,23 +267,9 @@ function waitForNextUpdate(): Promise<void> {
     return new Promise(resolve => director.once(DirectorEvent.AFTER_UPDATE, resolve));
 }
 
-/** 执行一次宿主初始化器；返回的 Node 作为本次 Profiler 生命周期内的固定宿主。 */
-async function initializePanelHost(): Promise<void> {
-    const initializer = _requestedInitializer;
-    if (!initializer) return;
-    const host = await initializer();
-    if (!host || !host.isValid) {
-        throw new Error('initializeProfiler 的 Promise 必须 resolve 一个有效的 cc.Node');
-    }
-    setProfilerPanelHost(host);
-}
-
 async function _initializeProfiler(waitForViewReady: boolean): Promise<void> {
     profilerCocos.ensureSetup();
     if (waitForViewReady) await waitForNextUpdate();
-    // showProfiler 可能先启动初始化，业务随后才传入异步初始化器；
-    // 放在首帧等待之后读取共享状态，显式初始化仍能升级正在进行的自动流程。
-    if (_requestedInitializer) await initializePanelHost();
 
     _initialized = true;
     const showAfterInitialization = _showAfterInitialization;
@@ -300,11 +285,7 @@ function _startInitialization(waitForViewReady: boolean): Promise<void> {
     _initializing = task;
     task.then(
         () => { if (_initializing === task) _initializing = null; },
-        () => {
-            if (_initializing !== task) return;
-            _initializing = null;
-            _requestedInitializer = null;   // 失败后允许下一次 initializeProfiler 传入新工厂重试
-        },
+        () => { if (_initializing === task) _initializing = null; },
     );
     return task;
 }
@@ -312,13 +293,11 @@ function _startInitialization(waitForViewReady: boolean): Promise<void> {
 /**
  * 显式初始化 Cocos Profiler。
  *
- * 首帧自动装配前调用会接管初始化；初始化器可自行等待外部 UI 就绪并返回宿主 Node。
- * Promise 完成前 show 请求只排队，不会创建 fallback Camera；不传初始化器则使用默认回退。
- * 初始化为 one-shot：进行中或已完成时重复调用只返回当前结果，不会更换宿主。
+ * 首帧自动装配前调用会接管初始化。宿主通过 registerProfilerPanelHostProvider
+ * 独立注册；未注册时使用默认的独立 Canvas/Camera。
  */
-export function initializeProfiler(initializer?: ProfilerInitializer): Promise<void> {
+export function initializeProfiler(): Promise<void> {
     _explicitInitializationRequested = true;
-    if (!_initialized && !_requestedInitializer && initializer) _requestedInitializer = initializer;
     return _startInitialization(true);
 }
 
